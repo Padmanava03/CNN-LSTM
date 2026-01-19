@@ -80,9 +80,6 @@ class DepthClassifier(nn.Module):
         return self.fc(x)
 
 class CNNLSTMDepthModel(nn.Module):
-    """
-    End-to-end CNN–LSTM model for EEG-based depth perception
-    """
     def __init__(self, num_channels):
         super().__init__()
 
