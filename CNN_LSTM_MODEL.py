@@ -1,3 +1,4 @@
+import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
@@ -16,7 +17,6 @@ class EEGCNN(nn.Module):
             kernel_size=(3, 3),
             padding=(1, 1)
         )
-
         self.bn1 = nn.BatchNorm2d(32)
 
         self.conv2 = nn.Conv2d(
@@ -25,10 +25,9 @@ class EEGCNN(nn.Module):
             kernel_size=(3, 3),
             padding=(1, 1)
         )
-
         self.bn2 = nn.BatchNorm2d(64)
 
-        # Pool only over frequency dimension
+        # Pool only across frequency (retain time)
         self.freq_pool = nn.AdaptiveAvgPool2d((1, None))
 
     def forward(self, x):
@@ -37,37 +36,82 @@ class EEGCNN(nn.Module):
         x = F.relu(self.bn1(self.conv1(x)))
         x = F.relu(self.bn2(self.conv2(x)))
 
-        # Pool over frequency → [B, 64, 1, T]
+        # Pool frequency → [B, 64, 1, T]
         x = self.freq_pool(x)
 
-        # Remove frequency dim → [B, 64, T]
+        # Remove freq dim → [B, 64, T]
         x = x.squeeze(2)
 
         return x
 
-class EEGLSTM(nn.Module):
+class EEGBiLSTM(nn.Module):
     """
-    LSTM for temporal depth-perception modeling
+    Bi-LSTM for temporal neural-state modeling
     Input : [B, T, D]
-    Output: [B, H]
+    Output:
+        - hidden_states: [B, T, 2H]
+        - final_embedding: [B, 2H]
     """
     def __init__(self, input_dim, hidden_dim=128, num_layers=1):
         super().__init__()
 
-        self.lstm = nn.LSTM(
+        self.bilstm = nn.LSTM(
             input_size=input_dim,
             hidden_size=hidden_dim,
             num_layers=num_layers,
-            batch_first=True
+            batch_first=True,
+            bidirectional=True
         )
 
     def forward(self, x):
         # x: [B, T, D]
-        _, (h_n, _) = self.lstm(x)
 
-        # Last layer hidden state → [B, H]
-        return h_n[-1]
+        output, (h_n, _) = self.bilstm(x)
 
+        # output → [B, T, 2H] (state sequence)
+        # h_n → [2*num_layers, B, H]
+
+        # Concatenate last forward & backward hidden states
+        h_forward = h_n[-2]
+        h_backward = h_n[-1]
+        final_embedding = torch.cat([h_forward, h_backward], dim=1)
+
+        return output, final_embedding
+
+class CNNBiLSTMEncoder(nn.Module):
+    """
+    Encoder-only model for unlabeled EEG depth perception
+    """
+    def __init__(self, num_channels):
+        super().__init__()
+
+        self.cnn = EEGCNN(in_channels=num_channels)
+        self.bilstm = EEGBiLSTM(input_dim=64, hidden_dim=128)
+
+    def forward(self, x):
+        """
+        Forward pass returning neural state sequence + embedding
+        """
+        # x: [B, C, F, T]
+
+        # CNN → [B, 64, T]
+        x = self.cnn(x)
+
+        # Prepare for LSTM → [B, T, 64]
+        x = x.permute(0, 2, 1)
+
+        # Bi-LSTM
+        state_seq, embedding = self.bilstm(x)
+
+        return state_seq, embedding
+
+    def encode(self, x):
+        """
+        Return only the trial-level latent embedding
+        """
+        _, embedding = self.forward(x)
+        return embedding
+    
 class DepthClassifier(nn.Module):
     """
     Final classification head
@@ -79,33 +123,38 @@ class DepthClassifier(nn.Module):
     def forward(self, x):
         return self.fc(x)
 
-class CNNLSTMDepthModel(nn.Module):
-    def __init__(self, num_channels):
+class CNNBiLSTMDepthModel(nn.Module):
+    def __init__(self, num_channels, num_classes=3):
         super().__init__()
 
         self.cnn = EEGCNN(in_channels=num_channels)
-        self.lstm = EEGLSTM(input_dim=64, hidden_dim=128)
-        self.classifier = DepthClassifier(input_dim=128, num_classes=3)
+
+        self.bilstm = nn.LSTM(
+            input_size=64,
+            hidden_size=128,
+            num_layers=1,
+            batch_first=True,
+            bidirectional=True
+        )
+
+        self.classifier = nn.Linear(256, num_classes)
 
     def forward(self, x):
-        # x: [B, C, F, T]
-
         # CNN → [B, 64, T]
         x = self.cnn(x)
 
         # Prepare for LSTM → [B, T, 64]
         x = x.permute(0, 2, 1)
 
-        # LSTM → [B, 128]
-        x = self.lstm(x)
+        # BiLSTM
+        state_seq, (h_n, _) = self.bilstm(x)
+        # state_seq: [B, T, 256]
 
-        # Class logits → [B, 3]
-        logits = self.classifier(x)
+        # Final embedding
+        h_forward = h_n[-2]   # [B, 128]
+        h_backward = h_n[-1]  # [B, 128]
+        Z = torch.cat([h_forward, h_backward], dim=1)  # [B, 256]
 
-        return logits
+        logits = self.classifier(Z)
 
-    def encode(self, x):
-        x = self.cnn(x)
-        x = x.permute(0, 2, 1)
-        z = self.lstm(x)          # latent embedding
-        return z                  # [B, 128]
+        return logits, state_seq, Z
