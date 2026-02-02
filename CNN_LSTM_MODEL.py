@@ -127,34 +127,10 @@ class CNNBiLSTMDepthModel(nn.Module):
     def __init__(self, num_channels, num_classes=3):
         super().__init__()
 
-        self.cnn = EEGCNN(in_channels=num_channels)
-
-        self.bilstm = nn.LSTM(
-            input_size=64,
-            hidden_size=128,
-            num_layers=1,
-            batch_first=True,
-            bidirectional=True
-        )
-
-        self.classifier = nn.Linear(256, num_classes)
+        self.encoder = CNNBiLSTMEncoder(num_channels)
+        self.classifier = DepthClassifier(input_dim=256, num_classes=num_classes)
 
     def forward(self, x):
-        # CNN → [B, 64, T]
-        x = self.cnn(x)
-
-        # Prepare for LSTM → [B, T, 64]
-        x = x.permute(0, 2, 1)
-
-        # BiLSTM
-        state_seq, (h_n, _) = self.bilstm(x)
-        # state_seq: [B, T, 256]
-
-        # Final embedding
-        h_forward = h_n[-2]   # [B, 128]
-        h_backward = h_n[-1]  # [B, 128]
-        Z = torch.cat([h_forward, h_backward], dim=1)  # [B, 256]
-
-        logits = self.classifier(Z)
-
-        return logits, state_seq, Z
+        _, embedding = self.encoder(x)
+        logits = self.classifier(embedding)
+        return logits
